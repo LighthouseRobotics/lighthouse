@@ -2,7 +2,7 @@
   "schema": "lighthouse-status/v1",
   "repository": "LighthouseRobotics/lighthouse",
   "status": "active",
-  "summary": "Shared contracts: lighthouse-bundle/v1 format with Python and JS verifiers; Sites security baseline helpers.",
+  "summary": "Shared contracts: lighthouse-bundle/v1 format with Python and JS verifiers; Sites security baseline helpers; local CI receipts (lighthouse-ci-receipt/v1) for workflows that hosted runners can't run.",
   "lastVerified": "2026-10-14",
   "verifiedBy": "scripts/check.sh (local; hosted CI is blocked by account billing)",
   "nextAction": "Adopt the bundle envelope in one producer (Manta photo packages are the closest fit) and the security baseline in Summit.",
