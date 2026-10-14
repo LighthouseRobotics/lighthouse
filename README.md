@@ -6,6 +6,7 @@ This repository holds what the LighthouseRobotics projects share. It isn't a pro
 | --- | --- | --- |
 | [`formats/bundle/`](formats/bundle/SPEC.md) | **lighthouse-bundle/v1**: one ZIP envelope any app can wrap its export in, with a verifier in Python (standard library only) and JavaScript (browser and Node) | Spec and both verifiers; a 55-case shared conformance corpus passes in both |
 | [`contracts/sites-security/`](contracts/sites-security/sites-security.mjs) | Reference helpers for the Sites security baseline: identity allowlist, framing, cross-site reads, safe errors, bounded bodies | Tested helpers; not yet adopted by any app |
+| [`formats/status/`](formats/status/README.md) | **lighthouse-status/v1**: one `STATUS.json` per repository root (status, last verified, next action, blockers, start here), with a JSON Schema and a standard-library checker. The vault builder reads it. | Spec, checker and tests; this repository's own `STATUS.json` is checked by `scripts/check.sh` |
 | [`tools/ci-local/`](tools/ci-local/README.md) | **Local CI receipts** (`lighthouse-ci-receipt/v1`): runs a project's GitHub workflow at an exact commit on this machine and writes a receipt that `verify` can check | Tested; first receipt: Network Atlas `check.yml`, 2026-10-14 |
 | [`docs/sites-security-baseline.md`](docs/sites-security-baseline.md) | The checklist and where each app stands | Written 2026-10-14 from source |
 | [`STATUS.json`](STATUS.json) | Machine-readable status for the vault builder | |
