@@ -1662,8 +1662,9 @@ class Runner:
                 raise Unsupported('checkout with %s' % flag)
         target, ref = self.commit, _str(with_.get('ref'))
         if ref:
-            target = None
-            for candidate in (ref, 'origin/' + ref, 'refs/tags/' + ref):
+            # A branch name means GitHub's copy of it, so the remote-tracking branch comes before a local one.
+            target, name = None, re.sub(r'^refs/heads/', '', ref)
+            for candidate in ('refs/remotes/origin/' + name, ref, 'refs/tags/' + name):
                 target = _git(self.repo, 'rev-parse', '--verify', '--quiet', candidate + '^{commit}', check=False)
                 if target:
                     break

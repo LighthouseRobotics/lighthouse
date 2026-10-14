@@ -420,6 +420,18 @@ jobs:
             ${{ runner.temp }}/../../outside.txt
 '''
 
+CHECKOUT_REF = '''
+on: workflow_dispatch
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: stale
+      - run: test "$(cat which.txt)" = new
+'''
+
 
 @unittest.skipUnless(shutil.which('git') and shutil.which('bash'), 'needs git and bash')
 class EndToEndTest(unittest.TestCase):
@@ -586,6 +598,22 @@ class EndToEndTest(unittest.TestCase):
             record = json.load(f)
         self.assertEqual((record['result'], record['differences'][-1]['kind']), ('incomplete', 'interrupted'))
         self.assertEqual(record['workflows'][0]['jobs'][0]['steps'][0]['result'], 'not-run')
+
+    def test_checkout_ref_prefers_the_remote_branch(self):
+        upstream = self.repo({'x.yml': CHECKOUT_REF}, {'which.txt': 'old'})
+        clone = tempfile.mkdtemp(prefix='ci-local-clone-')
+        self.addCleanup(shutil.rmtree, clone, True)
+        subprocess.run(['git', 'clone', '-q', upstream, clone], check=True)
+        _git(clone, 'branch', 'stale')
+        with open(os.path.join(upstream, 'which.txt'), 'w') as f:
+            f.write('new')
+        _git(upstream, 'commit', '-qam', 'move main')
+        _git(upstream, 'branch', 'stale')
+        _git(clone, 'fetch', '-q', 'origin')
+        code, record, _ = self.run_ci(clone, '--event', 'workflow_dispatch')
+        self.assertEqual((code, record['result']), (0, 'pass'), json.dumps(record['workflows'], indent=1))
+        self.assertEqual(record['workflows'][0]['jobs'][0]['steps'][0]['checked_out'], subprocess.check_output(
+            ['git', '-C', upstream, 'rev-parse', 'HEAD'], text=True).strip())
 
     def test_a_step_stops_at_its_timeout(self):
         code, record, _ = self.run_ci(self.repo({'x.yml': SLOW}))
