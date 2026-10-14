@@ -3,12 +3,14 @@
 Run: python3 -m unittest discover -s tools/ci-local -p 'test_*.py'
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -207,6 +209,60 @@ class FilterTest(unittest.TestCase):
         self.assertEqual(C.job_order({'c': {'needs': ['a', 'b']}, 'b': {'needs': 'a'}, 'a': {}}), ['a', 'b', 'c'])
         with self.assertRaisesRegex(C.RunnerError, 'cycle'):
             C.job_order({'a': {'needs': 'b'}, 'b': {'needs': 'a'}})
+
+
+class ToolCacheTest(unittest.TestCase):
+    def tarball(self, entries):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+            for name, kind, data in entries:
+                info = tarfile.TarInfo(name)
+                if kind == 'link':
+                    info.type, info.linkname = tarfile.SYMTYPE, data
+                    tar.addfile(info)
+                else:
+                    info.size, info.mode = len(data), 0o755
+                    tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def test_safe_extract_refuses_escapes(self):
+        for entries in ([('../evil', 'file', b'x')], [('/abs', 'file', b'x')], [('a/link', 'link', '/etc/passwd')],
+                        [('a/link', 'link', '../../outside')]):
+            dest = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, dest, True)
+            with tarfile.open(fileobj=io.BytesIO(self.tarball(entries)), mode='r:gz') as tar, \
+                    self.assertRaises(C.RunnerError):
+                C.safe_extract(tar, dest)
+            self.assertEqual(os.listdir(dest), [])
+
+    def test_fetch_node_checks_the_published_hash(self):
+        system = {'Linux': 'linux', 'Darwin': 'darwin'}.get(C.platform.system())
+        arch = {'x86_64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(C.platform.machine())
+        if not system or not arch:
+            self.skipTest('no official build for this platform')
+        top = 'node-v9.8.7-%s-%s' % (system, arch)
+        tar = self.tarball([(top + '/bin/node', 'file', b'#!/bin/sh\necho v9.8.7\n'),
+                            (top + '/bin/npm', 'link', '../lib/npm-cli.js'),
+                            (top + '/lib/npm-cli.js', 'file', b'')])
+        published = [hashlib.sha256(tar).hexdigest()]
+
+        def opener(url, timeout):
+            body = ('%s  %s.tar.gz\n' % (published[0], top)).encode() if url.endswith('SHASUMS256.txt') else tar
+            return contextlib.closing(io.BytesIO(body))
+
+        cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cache, True)
+        published[0] = 'f' * 64
+        with self.assertRaisesRegex(C.RunnerError, 'not the published'):
+            C.fetch_node('9.8.7', cache, opener)
+        published[0] = hashlib.sha256(tar).hexdigest()
+        dest, note = C.fetch_node('v9.8.7', cache, opener)
+        self.assertIn('matches nodejs.org', note)
+        self.assertEqual(C.cached_tool(cache, 'node', '9', 'node'), os.path.join(dest, 'bin'))
+        self.assertTrue(os.path.islink(os.path.join(dest, 'bin', 'npm')))
+        self.assertEqual(C.fetch_node('9.8.7', cache, opener)[1], 'already in the tool cache')
+        with self.assertRaisesRegex(C.RunnerError, 'exact'):
+            C.fetch_node('22', cache, opener)
 
 
 PASS = '''
@@ -491,6 +547,45 @@ class EndToEndTest(unittest.TestCase):
                          [os.path.join('_runner', 'temp', 'inside.txt')])
         self.assertEqual((code, record['result']), (0, 'pass'))
         self.assertEqual(C.verify_receipt(path, repo)[0], [])
+
+    def test_the_tool_cache_supplies_an_exact_version(self):
+        cache = tempfile.mkdtemp(prefix='ci-local-cache-')
+        self.addCleanup(shutil.rmtree, cache, True)
+        for version in ('1.2.3', '1.2.9', '1.3.0'):
+            os.makedirs(os.path.join(cache, 'node', version, 'bin'))
+            node = os.path.join(cache, 'node', version, 'bin', 'node')
+            with open(node, 'w') as f:
+                f.write('#!/bin/sh\necho v%s\n' % version)
+            os.chmod(node, 0o755)
+        self.assertEqual(C.cached_tool(cache, 'node', '1.2', 'node'), os.path.join(cache, 'node', '1.2.9', 'bin'))
+        self.assertIsNone(C.cached_tool(cache, 'node', '2', 'node'))
+        workflow = DRIFT.replace("'1'", "'1.2'").replace('echo checked', 'test "$(node --version)" = v1.2.9')
+        code, record, _ = self.run_ci(self.repo({'x.yml': workflow}), '--tool-cache', cache)
+        self.assertEqual((code, record['result'], record['differences']), (0, 'pass', []))
+        self.assertIn('from the tool cache', record['workflows'][0]['jobs'][0]['steps'][0]['note'])
+
+    def test_a_stopped_run_stops_its_steps_and_says_so(self):
+        out = tempfile.mkdtemp(prefix='ci-local-out-')
+        self.addCleanup(shutil.rmtree, out, True)
+        pidfile = os.path.join(out, 'step.pid')
+        repo = self.repo({'x.yml': SLOW.replace('        timeout-minutes: 0.02\n', '').replace(
+            'sleep 30', 'echo $$ > %s; sleep 300' % pidfile)})
+        p = subprocess.Popen([sys.executable, C.__file__, 'run', '--repo', repo, '--out', out, '--quiet'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            if os.path.isfile(pidfile) and open(pidfile).read().strip():
+                break
+            C.time.sleep(0.1)
+        with open(pidfile) as f:
+            step = int(f.read())
+        p.terminate()
+        self.assertEqual(p.wait(30), 2)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(step, 0)
+        with open(os.path.join(out, 'receipt.json')) as f:
+            record = json.load(f)
+        self.assertEqual((record['result'], record['differences'][-1]['kind']), ('incomplete', 'interrupted'))
+        self.assertEqual(record['workflows'][0]['jobs'][0]['steps'][0]['result'], 'not-run')
 
     def test_a_step_stops_at_its_timeout(self):
         code, record, _ = self.run_ci(self.repo({'x.yml': SLOW}))

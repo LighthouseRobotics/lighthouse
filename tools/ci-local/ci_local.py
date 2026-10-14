@@ -15,6 +15,7 @@ import argparse
 import datetime as _dt
 import glob
 import hashlib
+import io
 import json
 import os
 import platform
@@ -24,9 +25,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.request
 
 SCHEMA = 'lighthouse-ci-receipt/v1'
 LABEL = "Local CI on the owner's machine. Not a GitHub-hosted check."
@@ -1129,7 +1132,7 @@ def _os_release():
 
 class Runner:
     def __init__(self, repo, commit='HEAD', event='push', ref=None, base=None, base_branch='main', inputs=None,
-                 accept_drift=False, out=None, keep=False, quiet=False, host_env=None, pass_env=()):
+                 accept_drift=False, out=None, keep=False, quiet=False, host_env=None, pass_env=(), tool_cache=None):
         if event not in ('push', 'pull_request', 'workflow_dispatch'):
             raise RunnerError('choose push, pull_request or workflow_dispatch')
         self.repo = _git(os.path.abspath(repo), 'rev-parse', '--show-toplevel')
@@ -1140,6 +1143,7 @@ class Runner:
         self.base = self._commit(base) if base else None
         self.inputs_given = dict(inputs or {})
         self.accept_drift, self.keep, self.quiet = accept_drift, keep, quiet
+        self.tool_cache = os.path.abspath(tool_cache) if tool_cache else None
         self.name = self._repo_name()
         stamp = _dt.datetime.now(_dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         self.out = os.path.abspath(out or os.path.join('ci-local-receipts', '%s-%s-%s' % (
@@ -1630,6 +1634,10 @@ class Runner:
             timed_out = True
             _kill_group(p.pid)
             code = p.wait()
+        except KeyboardInterrupt:
+            _kill_group(p.pid)
+            p.wait()
+            raise
         finally:
             stop.set()
             if follower:
@@ -1684,7 +1692,10 @@ class Runner:
         want = with_.get('node-version')
         if want is None and with_.get('node-version-file'):
             want = self._version_file(ws, with_['node-version-file'])
-        have = _tool_version(['node', '--version'], ws)
+        cached = cached_tool(self.tool_cache, 'node', want, 'node') if want is not None else None
+        if cached:
+            path_prefix.insert(0, cached)
+        have = _tool_version([os.path.join(cached, 'node') if cached else 'node', '--version'], ws)
         srec['version'] = have
         if not have:
             raise Unsupported('Node.js, which is not installed here')
@@ -1692,6 +1703,8 @@ class Runner:
             return 'pass', 'no version requested; Node.js %s' % have, {'node-version': have}
         ok = version_matches(want, have)
         note = 'Node.js %s matches %s' % (have, _str(want)) if ok else self._drift('Node.js', want, have)
+        if cached:
+            note += ', from the tool cache'
         if with_.get('cache') or _truthy(with_.get('package-manager-cache', False)):
             note += '; package cache not used'
         return 'pass', note, {'node-version': have}
@@ -1701,7 +1714,9 @@ class Runner:
         if want is None and with_.get('python-version-file'):
             want = self._version_file(ws, with_['python-version-file'])
         m = re.fullmatch(r'(\d+)\.(\d+)(?:\.\d+)?', _str(want)) if want is not None else None
-        exe = (m and shutil.which('python%s.%s' % m.groups())) or shutil.which('python3')
+        cached = cached_tool(self.tool_cache, 'python', want, 'python3') if want is not None else None
+        exe = (cached and os.path.join(cached, 'python3')) or (m and shutil.which('python%s.%s' % m.groups())) \
+            or shutil.which('python3')
         if not exe:
             raise Unsupported('Python, which is not installed here')
         venv = os.path.join(jdir, 'python')
@@ -1807,6 +1822,83 @@ class Runner:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Tool cache: exact toolchain versions, laid out like a hosted runner's: <cache>/node/22.16.0/bin/node and
+# <cache>/python/3.12.7/bin/python3.
+
+def _version_key(name):
+    return tuple(int(x) for x in re.findall(r'\d+', name)[:3])
+
+
+def cached_tool(cache, tool, spec, exe):
+    """The bin folder of the newest cached version that satisfies spec, or None."""
+    if not cache:
+        return None
+    base = os.path.join(cache, tool)
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+    fits = [n for n in names if version_matches(spec, n) and os.access(os.path.join(base, n, 'bin', exe), os.X_OK)]
+    return os.path.join(base, max(fits, key=_version_key), 'bin') if fits else None
+
+
+def safe_extract(tar, dest):
+    """Extracts a tar archive, refusing absolute paths, `..`, devices and links that leave `dest`."""
+    root = os.path.realpath(dest)
+    for member in tar.getmembers():
+        target = os.path.realpath(os.path.join(root, member.name))
+        if os.path.isabs(member.name) or not (target == root or target.startswith(root + os.sep)):
+            raise RunnerError('the archive has a path outside its folder: %s' % member.name)
+        if not (member.isfile() or member.isdir() or member.issym()):
+            raise RunnerError('the archive has a special file: %s' % member.name)
+        if member.issym():
+            link = os.path.realpath(os.path.join(os.path.dirname(target), member.linkname))
+            if os.path.isabs(member.linkname) or not link.startswith(root + os.sep):
+                raise RunnerError('the archive has a link outside its folder: %s' % member.name)
+    checked = {'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}
+    for member in tar.getmembers():
+        tar.extract(member, root, **checked)
+
+
+def fetch_node(version, cache, opener=urllib.request.urlopen):
+    """Downloads an official Node.js build into the tool cache after checking it against nodejs.org's SHASUMS256."""
+    version = version.lstrip('v')
+    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        raise RunnerError('give an exact Node.js version such as 22.16.0')
+    system = {'Linux': 'linux', 'Darwin': 'darwin'}.get(platform.system())
+    arch = {'x86_64': 'x64', 'AMD64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine())
+    if not system or not arch:
+        raise RunnerError('no official Node.js build for %s %s' % (platform.system(), platform.machine()))
+    dest = os.path.join(os.path.abspath(cache), 'node', version)
+    if os.path.isfile(os.path.join(dest, 'bin', 'node')):
+        return dest, 'already in the tool cache'
+    name = 'node-v%s-%s-%s.tar.gz' % (version, system, arch)
+    base = 'https://nodejs.org/dist/v%s/' % version
+    with opener(base + 'SHASUMS256.txt', timeout=60) as r:
+        sums = r.read().decode('utf-8')
+    wanted = [line.split()[0] for line in sums.splitlines() if line.split()[-1:] == [name]]
+    if len(wanted) != 1:
+        raise RunnerError('SHASUMS256.txt for %s does not list %s' % (version, name))
+    with opener(base + name, timeout=600) as r:
+        data = r.read()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != wanted[0]:
+        raise RunnerError('%s has SHA-256 %s, not the published %s' % (name, digest, wanted[0]))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    work = tempfile.mkdtemp(dir=os.path.dirname(dest), prefix='.fetch-')
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tar:
+            safe_extract(tar, work)
+        top = os.path.join(work, name[:-len('.tar.gz')])
+        if not os.path.isfile(os.path.join(top, 'bin', 'node')):
+            raise RunnerError('%s does not contain bin/node' % name)
+        os.rename(top, dest)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return dest, 'SHA-256 %s matches nodejs.org SHASUMS256.txt' % digest
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # Verify a receipt.
 
 def verify_receipt(path, repo=None):
@@ -1896,16 +1988,27 @@ def main(argv=None):
                      help='let a run with other tool versions than the workflow asks for pass; the receipt '
                           'still lists every difference')
     run.add_argument('--pass-env', action='append', default=[], help='also pass this host variable to steps')
+    run.add_argument('--tool-cache', default=os.environ.get('CI_LOCAL_TOOL_CACHE'),
+                     help='folder of exact toolchains: node/<version>/bin, python/<version>/bin '
+                          '(default $CI_LOCAL_TOOL_CACHE)')
     run.add_argument('--ignore-filters', action='store_true', help='run workflows the event would not trigger')
     run.add_argument('--out', help='an empty folder for the receipt and logs')
     run.add_argument('--keep', action='store_true', help='keep the job workspaces')
     run.add_argument('--quiet', action='store_true', help='do not print step output')
     run.add_argument('--dry-run', action='store_true', help='print the plan; run nothing')
+    fetch = sub.add_parser('fetch-node', help='download an official Node.js build into the tool cache')
+    fetch.add_argument('version', help='an exact version such as 22.16.0')
+    fetch.add_argument('--tool-cache', default=os.environ.get('CI_LOCAL_TOOL_CACHE'), required=not os.environ.get(
+        'CI_LOCAL_TOOL_CACHE'))
     ver = sub.add_parser('verify', help='check a receipt and its logs, and optionally against the repository')
     ver.add_argument('receipt')
     ver.add_argument('--repo', help='the repository the receipt describes')
     args = ap.parse_args(argv)
     try:
+        if args.command == 'fetch-node':
+            dest, note = fetch_node(args.version, args.tool_cache)
+            print('Node.js %s: %s (%s)' % (args.version, dest, note))
+            return 0
         if args.command == 'verify':
             problems, r = verify_receipt(args.receipt, args.repo)
             for p in problems:
@@ -1915,9 +2018,13 @@ def main(argv=None):
             print('Receipt OK: %s for %s at %s (local CI, not a hosted check).' % (
                 r['result'], r['repository'].get('name'), r['repository']['commit'][:12]))
             return 0
+        def stop(_signum, _frame):
+            raise KeyboardInterrupt()
+        # A stopped runner still stops its steps' process groups and writes an "interrupted" receipt.
+        signal.signal(signal.SIGTERM, stop)
         runner = Runner(args.repo, args.commit, args.event, args.ref, args.base, args.base_branch,
                         _pairs(args.input, '--input'), args.accept_version_drift, args.out, args.keep, args.quiet,
-                        pass_env=args.pass_env)
+                        pass_env=args.pass_env, tool_cache=args.tool_cache)
         available = runner.workflow_paths()
         if args.workflow:
             chosen = [w if '/' in w else '.github/workflows/' + w for w in args.workflow]
