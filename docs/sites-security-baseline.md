@@ -25,10 +25,10 @@ On 2026-10-13, network-atlas#18 and art-history-future#3 each worked out most of
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Network Atlas | #18 | #18 | #18 | #18 | #18 | partly | n/a | Draft PR, not merged |
 | Cabinet (art-history-future) | #3 | ? | – | – | #3 | #3 | n/a | Draft PR, not merged |
-| Summit (elevate-and-peak) | – | – | – | n/a | partly | – | n/a | `next.config.ts` is empty, so no framing headers. `app/api/state/route.ts:16` returns `applyAction`'s `e.message` with 400, which is fine for validation errors but would also echo an unexpected `TypeError`. Server failures are already generic. |
-| Callout Trainer | n/a | n/a | – | n/a | n/a | n/a | – | Static. #1 fixed the XSS. `dist/index.html` has no CSP. |
+| Summit (elevate-and-peak) | – | – | branch | n/a | branch | – | n/a | Branch `claude/zen-brahmagupta-15jdby` (2026-10-14) adds the framing, nosniff and referrer headers and stops echoing an unexpected `TypeError` from `applyAction`. Checked on a local build: headers on `/` and `/api/state`; `tests/api.mjs` passes. Not merged. |
+| Callout Trainer | n/a | n/a | – | n/a | n/a | n/a | branch | Static. #1 fixed the XSS. Branch `claude/zen-brahmagupta-15jdby` (2026-10-14) adds a CSP meta tag: scripts self-only, inline styles allowed, Google Fonts allowed. Checked in Chromium: the smoke test passes, there are no violations, and an injected handler is refused. Not merged. |
 | KOTJ court | n/a | n/a | – | n/a | n/a | n/a | – | Static browser build |
 | Crate Theory | ? | ? | ? | ? | ? | ? | ? | crate-theory#21 raised a CSP `data:` question. Needs its own pass. |
 | OmniList | Access | – | ? | ? | partly | partly | n/a | Cloudflare Access plus workforce membership. #66 hardens the public webhook. |
 
-`–` means not present, `?` means not checked, and `n/a` means it doesn't apply. Update this table when an app adopts a line, and add a test per line.
+`–` means not present, `?` means not checked, `n/a` means it doesn't apply, and `branch` means it's done on an unmerged branch. Update this table when an app adopts a line, and add a test per line.
